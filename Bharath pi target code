@@ -1,0 +1,375 @@
+#define TINY_GSM_MODEM_SIM7600
+#define TINY_GSM_RX_BUFFER 1024
+#define TINY_GSM_TEST_SMS true
+
+
+#define SMS_TARGET "7845860047" // Your phone number for SMS notifications
+
+#define SerialAT Serial1
+#define SerialMon Serial
+
+#define GSM_PIN "" // SIM card PIN if needed
+
+const char apn[] = "www";
+const char gprsUser[] = "";
+const char gprsPass[] = "";
+
+String send_data_to_url = "https://eogas6eaag50nu2.m.pipedream.net";
+
+#include <TinyGsmClient.h> //Library version compatible 0.12.0
+#include <SPI.h> //ESP32 SPI Lib version - 2.0.16
+#include <ArduinoJson.h> //Lib version - 7.0.3
+#include <Ticker.h> //Lib version - 4.4.0
+
+#ifdef DUMP_AT_COMMANDS
+  #include <StreamDebugger.h>
+  StreamDebugger debugger(SerialAT, SerialMon);
+  TinyGsm modem(debugger);
+#else
+  TinyGsm modem(SerialAT);
+#endif
+
+#define UART_BAUD   115200
+#define PIN_TX      17
+#define PIN_RX      16
+#define PWR_PIN     26
+#define PIN_DTR     25
+#define MAINTENANCE_SWITCH_PIN 4
+#define RELAY_PIN 2
+#define BACKUP_BATTERY_SENSOR_PIN 0
+#define PANEL_SENSOR_PIN 2
+#define MAINS_VOLTAGE_SENSOR_PIN 4
+#define LED_PIN 2
+
+void modemPowerOn();
+void checkMaintenanceMode();
+void heartbeat();
+void panelvoltage24();
+void backupvoltage24();
+void voltage110();
+
+
+
+const unsigned long DEBOUNCE_DELAY = 2000;
+bool isInMaintenanceMode = false;  // Changed to false initially
+bool wasInMaintenanceMode = false;
+const String TRAIN_NUMBER = "Train No: 12674";
+const String COACH_NUMBER = "Coach No: B5-203813";
+unsigned long lastHeartbeatTime = 0;
+const unsigned long HEARTBEAT_INTERVAL_MS = 60000; // 1 hour in milliseconds (adjust as needed)
+float powerpanelvoltage;
+float batteryvoltage;
+const float ALERT_VOLTAGES[] = {25.0, 24.0, 23.0, 22.0, 21.0};  
+float lastVoltage = 27.0;  // Initialize above highest threshold
+bool wasAlertSent[5] = {false}; 
+
+// Relay switching at 18V
+const float RELAY_TRIGGER_VOLTAGE = 20.0;
+bool wasRelayTriggered = false;   // Track relay state
+// Backup Battery Settings (identical to panel voltage logic)
+const float BACKUP_ALERT_VOLTAGES[] = {25.0, 24.0, 23.0, 22.0, 21.0, 20.0, 19.0}; // Exact voltages for SMS
+const float BACKUP_CRITICAL_VOLTAGE = 18.0;                     // Critical threshold
+float lastBackupVoltage = 27.0;                                 // Track previous reading
+bool backupAlertsSent[7] = {false};                             // For exact voltage alerts
+bool wasCriticalSent = false;                                   // For 18V alert
+
+const float REFERENCE_VOLTAGE = 3.3;
+const float VOLTAGE_SCALE_FACTOR = 8.1818;
+bool isMainsVoltagePresent = true;
+bool wasMainsVoltagePresent = true;
+
+
+
+void setup() {
+  SerialMon.begin(115200);
+  pinMode(MAINTENANCE_SWITCH_PIN, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  delay(5000);
+
+  modemPowerOn();
+  SerialAT.begin(UART_BAUD, SERIAL_8N1, PIN_RX, PIN_TX);
+
+  SerialMon.println("Initializing Modem...");
+
+  // Initialize modem
+  if (!modem.init()) {
+    SerialMon.println("Failed to initialize modem");
+    return;
+  }
+
+
+  // Connect to network
+  SerialMon.println("Connecting to network...");
+  modem.setNetworkMode(2); // Automatic mode
+
+  bool isConnected = false;
+  int tryCount = 60;
+  while (tryCount--) {
+    isConnected = modem.waitForNetwork();
+    if (isConnected) {
+      break;
+    }
+    delay(1000);
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+  }
+
+  if (!isConnected) {
+    SerialMon.println("Failed to connect to network");
+    return;
+  }
+
+  digitalWrite(LED_PIN, HIGH);
+  SerialMon.println("Network connected successfully!");
+
+  // Send SMS notification
+  #if TINY_GSM_TEST_SMS && defined TINY_GSM_MODEM_HAS_SMS
+    SerialMon.println("Sending connection confirmation SMS...");
+    String smsMessage = "SMS system is ready to run";
+    if (modem.sendSMS(SMS_TARGET, smsMessage)) {
+      SerialMon.println("SMS sent successfully");
+    } else {
+      SerialMon.println("SMS failed to send");
+    }
+  #endif
+
+  // HTTP functionality (unchanged)
+  SerialMon.println("Testing HTTP connection...");
+  
+  StaticJsonDocument<200> payloadObj;
+  String payload;
+  payloadObj["status"] = "connected";
+  payloadObj["message"] = "System is operational";
+  serializeJson(payloadObj, payload);
+
+  modem.sendAT("+HTTPINIT");
+  if (modem.waitResponse(10000L) != 1) {
+    SerialMon.println("HTTP INIT failed");
+    return;
+  }
+
+  modem.sendAT("+HTTPPARA=\"URL\"," + send_data_to_url);
+  if (modem.waitResponse(10000L) != 1) {
+    SerialMon.println("URL setting failed");
+    return;
+  }
+
+  modem.sendAT("+HTTPPARA=\"CONTENT\",\"application/json\"");
+  if (modem.waitResponse(10000L) != 1) {
+    SerialMon.println("Content type setting failed");
+    return;
+  }
+
+  modem.sendAT("+HTTPDATA=" + String(payload.length()) + ",20000");
+  while (modem.waitResponse(1000UL, "DOWNLOAD") != 1) {
+    SerialMon.print(".");
+  }
+
+  modem.streamWrite(payload);
+  if (modem.waitResponse(10000L) != 1) {
+    SerialMon.println("Data sending failed");
+    return;
+  }
+
+  modem.sendAT("+HTTPACTION=1");
+  if (modem.waitResponse(1000UL) != 1) {
+    SerialMon.println("HTTP action failed");
+  } else {
+    SerialMon.println("HTTP request sent successfully");
+  }
+
+  modem.sendAT("+HTTPTERM");
+  delay(1000);
+
+  SerialMon.println("Setup completed successfully");
+}
+
+void loop() {
+  // Main loop can be empty or include periodic checks
+  delay(6000);  // Wait 6 sec
+
+  int signalQuality;
+  Serial.println("+++++++++++++++++++Start of main loop");
+    
+  signalQuality = modem.getSignalQuality();
+  Serial.print("Signal quality main loop first check: ");
+  Serial.println(signalQuality);
+
+  checkMaintenanceMode();  // First check maintenance mode - with debounce
+  delay(2000);
+
+  if (isInMaintenanceMode){
+  Serial.println("maintanance mode is not active");
+  panelvoltage24();
+  delay(2000);
+  backupvoltage24();
+  delay(2000);
+  voltage110();
+  delay(2000);
+  }
+  
+  signalQuality = modem.getSignalQuality();
+  Serial.print("Signal quality main loop second check: ");
+  Serial.println(signalQuality);
+  heartbeat(); // First message then 1min repeat
+
+  Serial.println("End of main loop++++++++++++++++++");
+}
+
+void modemPowerOn() {
+  pinMode(PWR_PIN, OUTPUT);
+  digitalWrite(PWR_PIN, LOW);
+  delay(1000);
+  digitalWrite(PWR_PIN, HIGH);
+}
+
+void checkMaintenanceMode() {
+  static int lastStableState = HIGH;  // Assuming HIGH is normal mode (pull-up)
+  static unsigned long lastDebounceTime = 0;
+  int currentState = digitalRead(MAINTENANCE_SWITCH_PIN);
+
+  // Debounce logic
+  if (currentState != lastStableState) {
+    lastDebounceTime = millis();
+  }
+
+  if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY) {
+    // Only proceed if state actually changed
+    if (currentState != isInMaintenanceMode) {
+      isInMaintenanceMode = (currentState == LOW);  // Assuming LOW activates maintenance
+      
+      if (isInMaintenanceMode) {
+        modem.sendSMS(SMS_TARGET, "Maintenance Mode ACTIVATED - Alerts disabled");
+        Serial.println("Maintenance Mode ACTIVATED");
+        isInMaintenanceMode=false;
+      } else {
+        modem.sendSMS(SMS_TARGET, "Maintenance Mode DEACTIVATED - Alerts enabled");
+        Serial.println("Maintenance Mode DEACTIVATED");
+        isInMaintenanceMode=true;
+      }
+    }
+  }
+
+  lastStableState = currentState;
+}
+
+void heartbeat(){
+  unsigned long currentMillis = millis();
+  Serial.println("calling heart beat");
+  String Message;
+   int vesdaRawValue = analogRead(PANEL_SENSOR_PIN); // 700 test value
+   float primaryVoltage = (vesdaRawValue / 4095.0) * REFERENCE_VOLTAGE * VOLTAGE_SCALE_FACTOR ;
+   int rawValue = analogRead(BACKUP_BATTERY_SENSOR_PIN);
+  float currentVoltage = (rawValue / 4095.0) * REFERENCE_VOLTAGE * VOLTAGE_SCALE_FACTOR ;
+
+    int signalQuality = modem.getSignalQuality();
+  int currentState = digitalRead(MAINTENANCE_SWITCH_PIN);
+  
+
+  if (currentMillis - lastHeartbeatTime >= HEARTBEAT_INTERVAL_MS) {
+    Message +=  String(TRAIN_NUMBER)+"\n";
+    Message +=  String(COACH_NUMBER)+"\n";
+    Message += "MAIN: " + String(isMainsVoltagePresent ? "ON\n" : "OFF\n");
+    Message += "PB:" + String(primaryVoltage,2) +"V\n";
+    Message += "BB:" + String(currentVoltage,2) +"V\n";
+    Message += "SS:" + String(signalQuality) +"\n";
+
+    Serial.println("heart beat should be sent out"); 
+    modem.sendSMS( SMS_TARGET , Message);
+
+    //sendSMS(phoneNumber, Message, "hearbeat");
+    lastHeartbeatTime = currentMillis;
+  }
+}
+
+void panelvoltage24() {
+  int vesdaRawValue = analogRead(PANEL_SENSOR_PIN);
+  float currentVoltage = (vesdaRawValue / 4095.0) * REFERENCE_VOLTAGE * VOLTAGE_SCALE_FACTOR ;
+
+  // --- Logic 1: Check for threshold crossings ---
+  for (int i = 0; i < sizeof(ALERT_VOLTAGES) / sizeof(ALERT_VOLTAGES[0]); i++) {
+    float threshold = ALERT_VOLTAGES[i];
+
+    // Detect crossing downward (e.g., 22.2V → 21.8V crosses 22.0V)
+    if (lastVoltage >= threshold && currentVoltage < threshold && !wasAlertSent[i]) {
+      String message = "PP bat low (" + String( currentVoltage ) + "V)";
+      modem.sendSMS(SMS_TARGET, message);
+      wasAlertSent[i] = true;  // Mark this threshold as alerted
+    }
+
+    // Reset alert flag if voltage recovers above threshold
+    if (currentVoltage > threshold) {
+      wasAlertSent[i] = false;
+    }
+  }
+
+  // --- Logic 2: Relay switching at 18.0V (unchanged) ---
+  if (currentVoltage <= 20.0 && !wasRelayTriggered) {
+    digitalWrite(RELAY_PIN, LOW);
+    wasRelayTriggered = true;
+    String message = "PP Bat (" + String( currentVoltage ) + "V)";
+    message += "Switched to BB bat.";
+      
+    modem.sendSMS(SMS_TARGET, message);
+  } 
+  else if (currentVoltage > 21.0 && wasRelayTriggered) {
+    digitalWrite(RELAY_PIN, HIGH);
+    wasRelayTriggered = false;
+  }
+
+  lastVoltage = currentVoltage;  // Update for next loop
+}
+
+
+void backupvoltage24() {
+  int rawValue = analogRead(BACKUP_BATTERY_SENSOR_PIN);
+  float currentVoltage = (rawValue / 4095.0) * REFERENCE_VOLTAGE * VOLTAGE_SCALE_FACTOR ;
+
+  // ===== EXACT VOLTAGE ALERTS (22.0V, 21.0V, 20.0V, 19.0V) =====
+  for (int i = 0; i < sizeof(BACKUP_ALERT_VOLTAGES)/sizeof(BACKUP_ALERT_VOLTAGES[0]); i++) {
+    float alertVoltage = BACKUP_ALERT_VOLTAGES[i];
+    
+    // Detect exact voltage matches
+    if (currentVoltage == alertVoltage && !backupAlertsSent[i]) {
+      String message = "Backup Battery AT " + String(alertVoltage, 1) + "V";
+      modem.sendSMS(SMS_TARGET, message);
+      backupAlertsSent[i] = true;
+    }
+    
+    // Reset alert if voltage recovers above threshold
+    if (currentVoltage > alertVoltage) {
+      backupAlertsSent[i] = false;
+    }
+  }
+
+  // ===== CRITICAL 20V ALERT (ONE-TIME) =====
+  if (currentVoltage <= BACKUP_CRITICAL_VOLTAGE && !wasCriticalSent) {
+      String message = "BB bat low (" + String(currentVoltage) + "V )";
+      message += "Take Action!";
+
+    modem.sendSMS(SMS_TARGET, message);
+    wasCriticalSent = true;
+  }
+  else if (currentVoltage > 19.0) {
+    wasCriticalSent = false; // Reset for future alerts
+  }
+
+  lastBackupVoltage = currentVoltage;
+}
+
+void voltage110(){
+
+  int mainsVoltageDigitalValue = digitalRead(MAINS_VOLTAGE_SENSOR_PIN); // LOW test value
+  
+  isMainsVoltagePresent = (mainsVoltageDigitalValue == LOW);
+  
+  if (!isMainsVoltagePresent && wasMainsVoltagePresent) {
+  Serial.print(" | Mains Status: "); Serial.println(isMainsVoltagePresent ? "Present" : "Absent");
+  String message = "110V Absent, Check Mains";
+   modem.sendSMS(SMS_TARGET, message);
+
+  }
+  wasMainsVoltagePresent = isMainsVoltagePresent;
+}
+
