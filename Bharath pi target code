@@ -11,8 +11,8 @@
 #define GSM_PIN "" // SIM card PIN if needed
 
 const char apn[] = "www";
-const char gprsUser[] = "";
-const char gprsPass[] = "";
+//const char gprsUser[] = "";
+//const char gprsPass[] = "";
 
 String send_data_to_url = "https://eogas6eaag50nu2.m.pipedream.net";
 
